@@ -47,7 +47,7 @@ class OverflowInteger(AbstractDetector):
                             elif ir.type == BinaryType.POWER:
                                 flag = maxAcceptable < maxLV**maxRV or minAcceptable > minLV**maxRV
                     if flag == True:   #flag==True -> overflow
-                        info = ['Overflow function found in function:', f.name, ' line:',n.source_mapping_str,'\n']
+                        info = ['Overflow function found in ', n,'\n']
                         res = self.generate_result(info)
                         results.append(res)
         return results

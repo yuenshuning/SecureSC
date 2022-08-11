@@ -185,7 +185,7 @@ class TOD(AbstractDetector):
                 ):
                     continue
                 
-                info = [func, "transaction ordering dependency\n"]
+                info = [func, " transaction ordering dependency\n"]
                 info += ["\tTransaction Ordering Dependency:\n"]
                 
                 taint_nodes = self.detect_tod(func, tainted_state)
