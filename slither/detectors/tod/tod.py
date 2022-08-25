@@ -49,6 +49,9 @@ class TOD(AbstractDetector):
         SolidityVariableComposed("block.timestamp"),
     ]
 
+    state_var = []
+    global_taint_nodes = []
+
     @staticmethod
     def is_direct_comparison(ir):
         return isinstance(ir, Binary) and ir.type == BinaryType.EQUAL
@@ -79,17 +82,19 @@ class TOD(AbstractDetector):
 
     # Retrieve all tainted (node, function) pairs
     def tainted_nodes(self, func, taints):
-        results = []
+        sink = []
+        taint_nodes = []
         taints += self.sources_taint
 
         # Disable the detector on top level function until we have good taint on those
         if isinstance(func, FunctionTopLevel):
-            return results
+            return taint_nodes
         for node in func.nodes:
+            # print(node, self.is_sensitive_operation(node))
             # case Init Node:
 
             # case Assignment Node: Explicit-taint-analysis (Data Dependency)
-            if node.type in [NodeType.EXPRESSION, NodeType.VARIABLE]: # msg.sender.transfer(REWARD) is also EXPRESSION
+            if node.type in [NodeType.EXPRESSION, NodeType.VARIABLE] and not node.contains_require_or_assert() and not self.is_sensitive_operation(node): # msg.sender.transfer(REWARD) is also EXPRESSION
                 for ir in node.irs:             # node.irs_ssa
                     # Filter to only tainted
                     for var in ir.used:
@@ -99,20 +104,63 @@ class TOD(AbstractDetector):
                                 for v in taints
                             ]):
                                 taints.append(var)
+                        # state data dependency
+                        if var in self.state_var and node in taint_nodes:
+                            if not any([
+                                var.name == v.name
+                                for v in self.global_taint_nodes
+                            ]):
+                                self.global_taint_nodes.append(var)
+
             # case IF / IF_LOOP / BEGIN_LOOP: Implicit-taint-analysis (Control Dependency)
-            elif node.type in [NodeType.IF]:
+            elif node.type in [NodeType.IF, NodeType.IFLOOP]:
                 for ir in node.irs:             # node.irs_ssa
                     for var in ir.used:
                         if self.is_any_tainted([var], taints, func):
-                            if node not in results:
-                                results.append(node)
+                            taint_node = self.control_dependency(node, func)
+                            taint_nodes = list(set(taint_node+taint_nodes))
+                            # if node not in taint_nodes:
+                            #     taint_nodes.append(node)
             
             # case require / assert, like require(a > b OR c is in d): Decontamination
+            elif node.type in [NodeType.EXPRESSION, NodeType.VARIABLE] and node.contains_require_or_assert():
+                for ir in node.irs:             # node.irs_ssa
+                    for var in ir.used:
+                        if self.is_any_tainted([var], taints, func):
+                            taint_node = self.control_dependency(node, func)
+                            taint_nodes = list(set(taint_node+taint_nodes))
+                            # if node not in taint_nodes:
+                            #     taint_nodes.append(node)
 
             # case Transfer / Selfdestruct / transferFrom(address,address,uint256): sink
-
+            elif self.is_sensitive_operation(node):
+                if node in taint_nodes or self.state_dependency_with_taint_nodes(node):
+                    sink.append(node)
                 
-        return results
+        return sink
+
+    def control_dependency(self, node, func):
+        res = []
+        nodes = func.nodes
+        node_index = nodes.index(node)
+        for i in range(node_index+1, len(nodes)):
+            node = nodes[i]
+            if node.contains_require_or_assert() or node.type in [NodeType.IF, NodeType.IFLOOP, NodeType.ENDIF, NodeType.ENDLOOP, NodeType.STARTLOOP, NodeType.BREAK, NodeType.THROW]:
+                return res
+            res.append(node)
+        return res
+    
+    def is_sensitive_operation(self, node):
+        is_send_eth = node.can_send_eth()
+        is_suicidal = any(
+            c.name in ["suicide(address)", "selfdestruct(address)"]
+            for c in node.internal_calls
+        )
+        return is_send_eth or is_suicidal
+        # return any(
+        #     c.name in ["require(bool)", "require(bool,string)", "assert(bool)"]
+        #     for c in node.internal_calls
+        # )
 
     def detect_tod(self, func, tainted_state):
         
@@ -126,14 +174,20 @@ class TOD(AbstractDetector):
         results = self.tainted_nodes(func, taints)
         return results
 
-    # TODO: state dependency taint analysis
-    def get_tainted_state(self, contract):
+    def state_dependency_with_taint_nodes(self, node):
+        for ir in node.irs:             # node.irs_ssa
+            for var in ir.used:
+                if var in self.global_taint_nodes:
+                    return True
+        return False
+
+    def get_state(self, contract):
         """
         Tainted state variables
         """
-        res = []
+        state_var = []
         if contract.is_top_level:
-            return res
+            return state_var
         for v in contract.state_variables:
             dep = {
                     d.name
@@ -141,8 +195,62 @@ class TOD(AbstractDetector):
                     if not isinstance(d, (TemporaryVariable, ReferenceVariable)) and d.name != v.name
                 }
             if len(dep) > 0:
-                res.append(v) 
-        return res
+                state_var.append(v)
+        return state_var
+
+    # TODO: more accurate, state dependency taint analysis, 
+    def get_tainted_state(self, contract):
+        """
+        Tainted state variables
+        """
+        state_var = []
+        taint_state_var = []
+        if contract.is_top_level:
+            return state_var
+        for v in contract.state_variables:
+            dep = {
+                    d.name
+                    for d in get_dependencies(v, contract)
+                    if not isinstance(d, (TemporaryVariable, ReferenceVariable)) and d.name != v.name
+                }
+            if len(dep) > 0:
+                state_var.append(v)
+        
+        for func in contract.functions:
+            if (
+                func.visibility in ["private"]
+                or func.is_constructor
+                or func.is_fallback
+                or func.is_constructor_variables
+                or not func.is_implemented
+            ):
+                continue
+            taints = func.parameters_ssa         # func.parameters or func.parameters_ssa
+            taints = func.parameters
+            taints += self.sources_taint
+            taints += taint_state_var
+
+            # Disable the detector on top level function until we have good taint on those
+            if isinstance(func, FunctionTopLevel):
+                return taint_nodes
+            for node in func.nodes:
+                # case Assignment Node: Explicit-taint-analysis (Data Dependency)
+                if node.type in [NodeType.EXPRESSION, NodeType.VARIABLE] and not node.contains_require_or_assert() and not self.is_sensitive_operation(node): # msg.sender.transfer(REWARD) is also EXPRESSION
+                    for ir in node.irs:             # node.irs_ssa
+                        # Filter to only tainted
+                        for var in ir.used:
+                            if self.is_any_tainted([var], taints, func):
+                                if not any([
+                                    var.name == v.name
+                                    for v in taints
+                                ]):
+                                    taints.append(var)
+                                if var in state_var and not any([
+                                    var.name == v.name
+                                    for v in taint_state_var
+                                ]):
+                                    taint_state_var.append(var)
+        return taint_state_var
 
     # TODO: state dependency taint analysis
     def get_tainted_state_ssa(self, contract):
@@ -169,7 +277,10 @@ class TOD(AbstractDetector):
         for contract in self.compilation_unit.contracts_derived:
             # funcs = contract.all_functions_called + contract.modifiers
             # non ssa
+            self.state_var = self.get_state(contract)
             tainted_state = self.get_tainted_state(contract)
+            self.global_taint_nodes = []
+
             # for key in contract.context["DATA_DEPENDENCY_SSA"].keys():
             #     print(key, '====')
             #     for i in contract.context["DATA_DEPENDENCY_SSA"][key]:
@@ -184,20 +295,20 @@ class TOD(AbstractDetector):
                     or not func.is_implemented
                 ):
                     continue
-                
-                info = [func, " transaction ordering dependency\n"]
-                info += ["\tTransaction Ordering Dependency:\n"]
-                
+
                 taint_nodes = self.detect_tod(func, tainted_state)
                 
-                # sort the nodes to get deterministic results
-                taint_nodes.sort(key=lambda x: x.node_id)
+                if taint_nodes:
+                    info = [func, " transaction ordering dependency\n"]
+                    info += ["\tTransaction Ordering Dependency:\n"]
+                    # sort the nodes to get deterministic results
+                    taint_nodes.sort(key=lambda x: x.node_id)
 
-                for node in taint_nodes:
-                    info += ["\t- ", node, "\n"]
+                    for node in taint_nodes:
+                        info += ["\t- ", node, "\n"]
 
-                res = self.generate_result(info)
+                    res = self.generate_result(info)
 
-                results.append(res)
+                    results.append(res)
 
         return results
