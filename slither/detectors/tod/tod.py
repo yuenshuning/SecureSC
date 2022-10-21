@@ -16,6 +16,7 @@ from slither.core.declarations.solidity_variables import (
     SolidityFunction,
 )
 from slither.slithir.operations import (
+    Index,
     Assignment,
     Binary,
     BinaryType,
@@ -23,6 +24,7 @@ from slither.slithir.operations import (
     SolidityCall,
 )
 from slither.slithir.variables import (
+    Constant,
     TemporaryVariable,
     ReferenceVariable
 )
@@ -51,6 +53,7 @@ class TOD(AbstractDetector):
 
     state_var = []
     global_taint_nodes = []
+    access_control_state_var = []
 
     @staticmethod
     def is_direct_comparison(ir):
@@ -76,18 +79,15 @@ class TOD(AbstractDetector):
             )
         )
 
-    def taint_source(self, func):
-        taints = []
-        return taints
-
     # Retrieve all tainted (node, function) pairs
+    # TODO: func modifier
     def tainted_nodes(self, func, taints):
         sink = []
         taint_nodes = []
         taints += self.sources_taint
 
         # Disable the detector on top level function until we have good taint on those
-        if isinstance(func, FunctionTopLevel):
+        if isinstance(func, FunctionTopLevel) or self.is_access_control(func):
             return taint_nodes
         for node in func.nodes:
             # print(node, self.is_sensitive_operation(node))
@@ -138,6 +138,34 @@ class TOD(AbstractDetector):
                     sink.append(node)
                 
         return sink
+
+    def is_access_control(self, f) -> bool:
+        # The onlyOwner modifier prevents calling the contract
+        exclusive = list(filter(lambda x:str(x.type)=='address', self.access_control_state_var))
+        for modifier in f.modifiers:
+            if self.is_access_control(modifier):
+                return True
+        for node in f.nodes:
+            for ir in node.irs:
+                if isinstance(ir, Index): # roles[0]
+                    tmp = isinstance(ir.variable_right, Constant)
+                    if tmp:
+                        exclusive.append(ir._lvalue)
+                elif isinstance(ir, SolidityCall): # ecrecover, merkle
+                    tmp = ir.function.full_name
+                    if any(name in tmp for name in ['ecrecover', 'merkle', 'Merkle']):
+                        exclusive.append(ir._lvalue)
+                elif isinstance(ir, BinaryType): # ecrecover, merkle
+                    for var in ir.used: # msg.sender
+                        if var.name == 'msg.sender':            
+                            ir.used.remove(var)
+                            for v in ir.used:
+                                if any([
+                                        v.name == ex.name and v.name != 'msg.sender'
+                                        for ex in exclusive
+                                    ]):
+                                    return True
+        return {"onlyOwner", "onlyManager"}&{modifier.name for modifier in f.modifiers}
 
     def control_dependency(self, node, func):
         res = []
@@ -280,16 +308,12 @@ class TOD(AbstractDetector):
             self.state_var = self.get_state(contract)
             tainted_state = self.get_tainted_state(contract)
             self.global_taint_nodes = []
-
-            # for key in contract.context["DATA_DEPENDENCY_SSA"].keys():
-            #     print(key, '====')
-            #     for i in contract.context["DATA_DEPENDENCY_SSA"][key]:
-            #         print(i)
+            self.access_control_state_var = contract.state_variables
 
             for func in contract.functions:
                 if (
-                    func.visibility in ["private"]
-                    or func.is_constructor
+                    # func.visibility in ["private"]
+                    func.is_constructor
                     or func.is_fallback
                     or func.is_constructor_variables
                     or not func.is_implemented
